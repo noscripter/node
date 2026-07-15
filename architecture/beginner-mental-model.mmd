@@ -1,0 +1,26 @@
+flowchart LR
+  USER["食客：你的 JavaScript 程序"]
+  API["前厅：fs、http、timers、streams 等 JS API"]
+  WINDOW["员工窗口：internalBinding，把 JS 请求交给 C++"]
+
+  subgraph ENV["一家完整分店：一个 Node Environment"]
+    V8["V8 主厨：执行 JS、管理 heap、JIT 与 GC"]
+    MANAGER["Node C++ 店长：管理进程、资源、生命周期和回调边界"]
+    UV["libuv 领班：event loop、timer、I/O 与任务分派"]
+    READY["出餐台：完成事件回到所属 loop，准备运行 JS callback"]
+  end
+
+  POLLER["OS 呼叫器：epoll / kqueue 报 readiness；IOCP 报 completion"]
+  POOL["共享后厨：libuv worker pool 处理文件、系统 DNS 和部分 crypto/压缩"]
+  WORKER["另一家分店：Worker 独立线程、Isolate、heap、loop 与 Environment"]
+  V8BG["V8 维修班：部分可并发 GC/编译等引擎工作；不直接替你运行用户 callback"]
+
+  USER --> API
+  API -->|普通 JS| V8
+  API -->|需要 native 能力| WINDOW --> MANAGER --> UV
+  UV -->|网络等待| POLLER --> READY
+  UV -->|可能阻塞的 native 工作| POOL --> READY
+  READY -->|callback / Promise continuation| API
+  USER -->|CPU 密集 JS| WORKER
+  WORKER -->|MessagePort / structured clone| API
+  V8 --> V8BG

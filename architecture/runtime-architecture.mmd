@@ -19,7 +19,7 @@ flowchart TB
     LOADERS["用户模块装载：CJS 与 ESM 的 resolve、cache、hooks、compile/evaluate"]
     PUBLIC["公共核心 API：fs、net、http、streams、timers、crypto、worker、fetch 等"]
     INTERNAL["lib/internal：参数校验、策略组合、兼容逻辑与内部状态"]
-    TASKS["调度语义：timer/immediate、process.nextTick、Promise microtask 与 rejection"]
+    TASKS["调度交汇：timer/immediate、Node nextTick queue、V8 microtask queue 与 rejection"]
   end
 
   subgraph BRIDGE["JS ↔ Native 边界与对象生命周期"]
@@ -30,7 +30,7 @@ flowchart TB
   end
 
   subgraph NATIVE["执行引擎、跨平台 I/O 与专用原生库（deps/）"]
-    V8["V8：ECMAScript / WebAssembly、JIT、GC、Isolate、Context、microtask"]
+    V8["V8：ECMAScript / WebAssembly、JIT、GC、Isolate、Context 与 microtask queue"]
     UV["libuv：事件循环、socket poll、timer、process、FS/DNS 抽象与全局线程池"]
     PROTOCOL["OpenSSL / ncrypto、llhttp、nghttp2、c-ares：TLS、加密与网络协议"]
     DATA["ICU、Ada、simdutf、zlib/Brotli/zstd、SQLite：文本、URL、压缩与数据能力"]
@@ -38,9 +38,9 @@ flowchart TB
   end
 
   subgraph RESOURCES["实际并发资源与操作系统"]
-    POLLER["epoll / kqueue / IOCP：网络 readiness；回调在所属 loop 线程执行"]
+    POLLER["OS I/O 通知：epoll/kqueue readiness；IOCP completion；JS 回调仍在所属 loop 线程"]
     UVPOOL["libuv 全局 worker pool：FS、系统 DNS、部分 crypto/压缩和 uv_queue_work"]
-    V8BG["V8 Platform 后台线程：GC/JIT 等引擎任务，不直接运行用户回调"]
+    V8BG["V8 Platform 后台线程：部分可并发 GC/编译等引擎任务，不直接运行用户回调"]
     OS["OS：文件、socket、进程、信号、终端与系统时钟"]
   end
 

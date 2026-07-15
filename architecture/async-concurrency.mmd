@@ -1,24 +1,26 @@
 flowchart LR
-  JS["某个 Environment 的 JS 回调线程：同一时刻只执行一段用户 JS"]
+  JS["某个 Environment 的 JS 线程：普通用户 JS callback run-to-completion"]
   API{"异步工作的性质"}
-  NET["网络 socket / pipe：注册非阻塞 readiness"]
-  FILE["FS、getaddrinfo、部分 crypto/压缩：提交可能阻塞的原生工作"]
+  NET["网络 socket / pipe：向平台 I/O 机制登记非阻塞操作"]
+  FILE["FS、getaddrinfo、部分 crypto/压缩：提交可能阻塞的 native 工作"]
   CPU["CPU 密集用户 JavaScript：显式创建 Worker"]
-  MICRO["Promise microtask / process.nextTick：进入 per-Isolate / per-Environment 队列"]
+  PROMISE["Promise reaction / queueMicrotask：当前 Context 关联的 V8 MicrotaskQueue"]
+  TICK["process.nextTick：当前 Environment 的 Node queue"]
 
-  POLL["OS poller：epoll / kqueue / IOCP"]
+  POLL["OS I/O 通知：epoll/kqueue readiness；IOCP completion"]
   POOL["libuv 全局 worker pool：默认 4，可由 UV_THREADPOOL_SIZE 调整"]
   WORKER["Worker OS 线程：独立 Isolate、heap、GC、uv_loop 与 module cache"]
-  LOOP["所属 event loop：取回 completion 并建立 native → JS callback scope"]
-  QUEUE["nextTick / microtask / rejection checkpoint"]
-  CALLBACK["用户 callback / Promise continuation：仍在所属 JS 线程运行"]
+  LOOP["所属 event loop：接收 I/O / worker completion"]
+  RUN["在所属 JS 线程运行用户 callback / Promise continuation"]
+  CHECK["callback 边界 checkpoint：Node nextTick、V8 microtasks 与 rejection"]
 
   JS --> API
   API -->|非阻塞 I/O| NET --> POLL --> LOOP
   API -->|阻塞或 CPU 型 native work| FILE --> POOL --> LOOP
   API -->|并行 JS| CPU --> WORKER -->|MessagePort / structured clone| LOOP
-  API -->|语言级任务| MICRO --> QUEUE
-  LOOP --> QUEUE --> CALLBACK --> JS
+  API -->|Promise / queueMicrotask| PROMISE --> CHECK
+  API -->|Node 特有队列| TICK --> CHECK
+  LOOP --> RUN --> CHECK --> JS
 
-  V8BG["V8 Platform background threads：处理 GC/JIT 等引擎任务"]
-  V8BG -.完成后把 foreground task 投回.-> LOOP
+  V8BG["V8 Platform background threads：处理部分可并发 GC/编译等引擎工作"]
+  V8BG -.需要进入 Isolate 时把 foreground task 投回.-> LOOP

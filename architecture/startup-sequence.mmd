@@ -18,9 +18,10 @@ flowchart TD
   USER["用户代码注册 handle、request、timer、microtask 或 Worker"]
 
   SPIN["SpinEventLoopInternal"]
-  UV["uv_run：等待 I/O、timer 与 native completion"]
-  TASKS["DrainTasks：V8 foreground tasks、nextTick、microtask 与 rejection checkpoint"]
-  CALLBACK["在所属 event-loop 线程运行 JS callback"]
+  UV["uv_run：等待并分派 timer、I/O 与 native completion"]
+  CALLBACK["native → JS callback scope：在所属 event-loop 线程运行用户 callback"]
+  CHECK["callback 返回边界：处理 Node nextTick、V8 microtasks 与 rejection"]
+  V8TASKS["platform → DrainTasks：排空该 Isolate 的 V8 foreground tasks"]
   ACTIVE{"仍有 referenced work？"}
   BEFORE["触发 beforeExit"]
   REENTER{"beforeExit 是否又创建 referenced work？"}
@@ -35,7 +36,9 @@ flowchart TD
   MODE -->|CJS| CJS --> USER
   MODE -->|ESM| ESM --> USER
   MODE -->|其他| OTHER --> USER
-  USER --> SPIN --> UV --> TASKS --> CALLBACK --> ACTIVE
+  USER --> SPIN --> UV
+  UV -->|分派 callback| CALLBACK --> CHECK --> V8TASKS
+  UV -->|本轮返回| V8TASKS --> ACTIVE
   ACTIVE -->|是| UV
   ACTIVE -->|否| BEFORE --> REENTER
   REENTER -->|是| UV
