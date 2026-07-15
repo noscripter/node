@@ -1,0 +1,172 @@
+<title>Node.js Core 全景架构与核心思想</title>
+
+<callout emoji="📌" background-color="light-blue" border-color="blue">
+  <p><b>分析基线：</b><code>main@7a11a9b2db0983fa65b52e91fd21814f1ed3c207</code>，源码版本 <code>v27.0.0-pre</code>，2026-07-15。当前 checkout 没有 <code>out/</code> 构建产物；本文描述当前提交的源码架构，不把它表述成某个已安装二进制的运行时验证。</p>
+</callout>
+
+<h1>1. 一句话结论</h1>
+
+<p>Node.js 不是“V8 加几个 API”，也不是“一条线程处理所有工作”。它是一个运行时编排器：V8 负责 JavaScript 与 WebAssembly 的执行、JIT、GC 和 microtask；libuv 负责跨平台事件循环、非阻塞 I/O 与工作线程池；Node C++ 核心负责进程、VM、线程、原生资源和生命周期；内嵌 JavaScript 负责公共 API、模块系统、兼容策略与调度语义。</p>
+
+<p>从第一性原理看，V8 只有语言引擎而没有 <code>fs</code>、socket、进程和 Node 模块语义，libuv 只有 C 层异步机制而没有 JavaScript 对象模型。Node.js 的核心价值，是把两者连成一个有稳定 API、可诊断、可扩展、可跨平台发布的完整宿主环境。</p>
+
+<h1>2. 运行时全景架构</h1>
+
+<p>下图按“用户语义 → Node 内核 → 引擎/依赖 → OS”展开，同时把主 JS 线程、libuv 全局线程池、Worker 独立 Isolate 和 V8 后台线程分开。</p>
+
+<whiteboard type="mermaid" path="@architecture/runtime-architecture.mmd"></whiteboard>
+
+<table>
+  <thead><tr><th>层</th><th>主要组成</th><th>用途</th></tr></thead>
+  <tbody>
+    <tr><td>入口与用户层</td><td>CLI、REPL、CJS/ESM、SEA、Embedder、原生 addon</td><td>选择运行模式并提供用户扩展面。</td></tr>
+    <tr><td>JS 语义层</td><td>bootstrap、BuiltinModule、CJS/ESM loader、公共 API、lib/internal</td><td>实现模块、校验、stream、timer、兼容和 Web API 等高层语义。</td></tr>
+    <tr><td>JS/native bridge</td><td>internalBinding、BaseObject、AsyncWrap、HandleWrap、ReqWrap、Node-API</td><td>跨越 V8 与 C++，协调对象生命、异步上下文和 addon ABI。</td></tr>
+    <tr><td>C++ 编排层</td><td>Start、NodeMainInstance、Environment、Realm、Worker、SpinEventLoop</td><td>管理进程、VM、线程、event loop、诊断和清理顺序。</td></tr>
+    <tr><td>引擎与依赖</td><td>V8、libuv、OpenSSL、llhttp、nghttp2、c-ares、ICU、压缩库、Undici 等</td><td>提供语言执行、OS 抽象、协议、安全、文本与数据能力。</td></tr>
+  </tbody>
+</table>
+
+<h1>3. 实例与所有权模型</h1>
+
+<p>理解 Node.js 源码最有效的方法，不是先记几百个文件，而是先区分以下对象各自拥有的状态。</p>
+
+<table>
+  <thead><tr><th>边界</th><th>定义与用途</th></tr></thead>
+  <tbody>
+    <tr><td>Process</td><td>持有一次性初始化的 V8 Platform、全局选项、信号/stdio、OpenSSL 状态和内建 binding 注册表。</td></tr>
+    <tr><td>MultiIsolatePlatform</td><td>Node 对 v8::Platform 的实现，为多个 Isolate 调度 V8 foreground/background 工作。</td></tr>
+    <tr><td>v8::Isolate</td><td>独立 JS VM，拥有 heap、GC 和引擎状态；主线程与每个 Worker 各自有一个。</td></tr>
+    <tr><td>v8::Context</td><td>一个 global 与一套 intrinsic；vm.Context 可在同一 Isolate 中创建多个 Context，但它不等于完整 Node 实例。</td></tr>
+    <tr><td>Realm</td><td>Node 对 ECMAScript realm 的包装，保存 per-realm builtin/binding、cleanup hooks 和 BaseObject 列表。</td></tr>
+    <tr><td>Environment</td><td>一个 Node 实例；关联一个 uv_loop_t、一个 Isolate 和一个 principal Realm，并保存 timer、async hooks、inspector、process 与退出状态。</td></tr>
+    <tr><td>BaseObject</td><td>把 V8 object 与 C++ 实例绑定，协调 JS GC 和 native resource 生命周期。</td></tr>
+    <tr><td>AsyncWrap / HandleWrap / ReqWrap</td><td>增加 async id/trigger id、native→JS callback scope，以及 libuv handle/request 的 ref、close 和清理语义。</td></tr>
+  </tbody>
+</table>
+
+<p>这套分层解决一个基本矛盾：V8 对象生命由 GC 决定，而 socket、文件请求和 timer 的生命由 OS/libuv 决定。只依赖 GC 会过早回收活跃资源，只依赖 native 引用又会泄漏；BaseObject 及其子类把两种生命周期显式对齐。源码总说明位于 <code>src/README.md:278-408,917-1078</code>。</p>
+
+<h1>4. 从进程启动到退出</h1>
+
+<whiteboard type="mermaid" path="@architecture/startup-sequence.mmd"></whiteboard>
+
+<p>Unix <code>main()</code> 最终只调用 <code>node::Start()</code>；Windows 参数转码后汇合到同一入口。<code>StartInternal()</code> 完成 argv 设置、一次性进程初始化、SEA/snapshot 分支，并用默认 loop、NodePlatform 和参数构造 <code>NodeMainInstance</code>。关键路径是 <code>src/node_main.cc:34-98</code>、<code>src/node.cc:1564-1639</code>、<code>src/node_main_instance.cc:33-110</code>。</p>
+
+<p><b>Snapshot 与冷启动不是同一路。</b>默认非交叉编译构建会生成 Node snapshot。构建期的 <code>node_mksnapshot</code> 预先执行 snapshot-safe bootstrap 并保存 V8 heap/code cache；运行时通常反序列化这些状态。只有无 snapshot 路径才完整运行 primordials → realm.js → node.js → web/thread/process-state switches。运行时相关的 argv、env、权限、IPC、preload 和 loader 配置必须留到 <code>pre_execution.js</code>，否则构建机状态会被冻进二进制。</p>
+
+<p><b>Event loop 不只是 uv_run。</b><code>SpinEventLoopInternal()</code> 交替执行 libuv、V8 foreground tasks、beforeExit 重入和最终 exit。loop 空时 beforeExit 仍可创建 referenced work 并重新激活 loop；真正退出后才按反向依赖清理 Worker、handle、Realm、Environment、Isolate 与 Platform。核心实现位于 <code>src/api/embed_helpers.cc:23-77</code>。</p>
+
+<h1>5. 异步与并发模型</h1>
+
+<whiteboard type="mermaid" path="@architecture/async-concurrency.mmd"></whiteboard>
+
+<table>
+  <thead><tr><th>机制</th><th>是否执行用户 JS</th><th>典型工作</th><th>关键语义</th></tr></thead>
+  <tbody>
+    <tr><td>OS 网络 poller</td><td>否</td><td>socket/pipe readiness</td><td>readiness 回所属 loop，用户 callback 仍在该 JS 线程执行。</td></tr>
+    <tr><td>libuv 全局 worker pool</td><td>否</td><td>FS、getaddrinfo/getnameinfo、uv_queue_work、部分 crypto/压缩</td><td>所有 main/Worker loop 共享；默认 4，可通过 UV_THREADPOOL_SIZE 调整。</td></tr>
+    <tr><td>worker_threads Worker</td><td>是</td><td>CPU 密集 JS、独立模块图和事件循环</td><td>独立 OS 线程、Isolate、heap、GC、loop；通过消息、转移或显式共享内存通信。</td></tr>
+    <tr><td>V8 Platform 后台线程</td><td>通常否</td><td>GC、JIT 和 VM 后台任务</td><td>需要进入 JS 的 foreground task 回投所属 Isolate 的 loop。</td></tr>
+  </tbody>
+</table>
+
+<p>网络 socket 可由 epoll/kqueue/IOCP 报告 readiness，因此通常不占用一个 worker 等待；跨平台文件系统接口没有统一可靠的同类机制，libuv 因而把异步文件操作放到线程池。异步不等于“callback 在线程池跑”：线程池只做 native 工作，completion 回到提交请求的 event loop 后才运行用户 callback。</p>
+
+<p><b>一个重要资源竞争：</b>libuv pool 是进程级共享资源。慢文件请求、系统 DNS、部分 crypto/压缩和 addon async work 可能互相排队；增大 pool 不会让网络 readiness 或 CPU 密集用户 JS 自动加速。</p>
+
+<h1>6. 模块、binding 与内核安全边界</h1>
+
+<table>
+  <thead><tr><th>装载平面</th><th>载荷</th><th>为什么独立</th></tr></thead>
+  <tbody>
+    <tr><td>BuiltinModule</td><td>lib/**/*.js 与选定内嵌依赖 JS</td><td>内核必须在 fs、用户 hooks 和用户模块之前可信启动，且不能依赖安装目录磁盘 I/O。</td></tr>
+    <tr><td>CJS loader</td><td>CommonJS、JSON、.node 等</td><td>保留同步 require、require.cache、扩展搜索与历史 monkey patch 兼容。</td></tr>
+    <tr><td>ESM loader</td><td>URL 化的 ESM/WasM/TS 模块图</td><td>支持 resolve/load/translate、link/evaluate、TLA 与同步/异步 customization hooks。</td></tr>
+  </tbody>
+</table>
+
+<p><code>realm.js</code> 先建立 <code>process.binding()</code>、<code>process._linkedBinding()</code>、core-private 的 <code>internalBinding()</code> 和 <code>BuiltinModule</code>。<code>internalBinding()</code> 在当前 Realm 缓存导出；C++ 端再从内部 module registry 找到注册函数，并在当前 Context 初始化 exports。对应证据为 <code>lib/internal/bootstrap/realm.js:1-39,185-238</code> 和 <code>src/node_binding.cc:585-663</code>。</p>
+
+<p><b>Primordials 的原因。</b>用户可以修改 Array.prototype、Promise 等 intrinsic。若 core 直接调用这些可变方法，guest code 就能改变宿主内核的校验、容器和错误语义。per-context bootstrap 因而提前保存安全引用与 SafeMap/SafeSet，并通过闭包提供给 internal modules。</p>
+
+<h1>7. 公共子系统与关键依赖</h1>
+
+<table>
+  <thead><tr><th>子系统</th><th>JS 层</th><th>Native/依赖层与运行特征</th></tr></thead>
+  <tbody>
+    <tr><td>fs</td><td>参数、callback/Promise、对象与兼容语义</td><td>node_file.cc 调 uv_fs_*；异步文件调用进入 pool，完成回所属 loop。</td></tr>
+    <tr><td>timers / immediate</td><td>timer 列表、优先级、重复调度</td><td>每个 Environment 使用少量 uv_timer/check handle，不是每个 timer 一条线程。</td></tr>
+    <tr><td>streams</td><td>状态机、pipe、Transform、highWaterMark/drain 背压</td><td>具体 source/sink 可是 socket、file、crypto、zlib；背压限制内存增长，不会搬走阻塞计算。</td></tr>
+    <tr><td>net / dgram / pipe</td><td>Socket/Server、连接与事件语义</td><td>libuv handle + OS poller；通常不为每个连接占一个线程。</td></tr>
+    <tr><td>HTTP/1 / HTTP/2</td><td>request/response、Agent、session/stream 与 socket 生命周期</td><td>llhttp、nghttp2 在所属 loop 路径解析协议；多路复用不等于多个 JS 线程。</td></tr>
+    <tr><td>Fetch / WebSocket</td><td>WHATWG API 与客户端策略</td><td>按需加载内嵌 Undici；它与传统 node:http 是不同的上层客户端栈。</td></tr>
+    <tr><td>DNS</td><td>统一 API 与结果语义</td><td>dns.lookup 走系统 getaddrinfo/pool；dns.resolve* 走 c-ares socket/loop。</td></tr>
+    <tr><td>TLS / crypto</td><td>JS API、Key/Object、Web Crypto promise</td><td>OpenSSL/ncrypto；只有显式 async CryptoJob 进入 pool，TLS/同步计算仍可占 loop。</td></tr>
+    <tr><td>diagnostics</td><td>diagnostics_channel、async_hooks、perf hooks 等观察面</td><td>AsyncWrap、trace events、V8 Inspector；publish 本身同步，观测代码也有开销。</td></tr>
+  </tbody>
+</table>
+
+<p>关键 vendored 能力还包括 V8、libuv、ICU/simdutf、Ada URL parser、zlib/Brotli/zstd、Amaro TypeScript type stripping、SQLite，以及 SEA 使用的 postject/LIEF。npm/Corepack 是随发行包交付的工具，不在 Node 主进程启动链核心。不能由“位于 deps”推导出“所有配置都链接并初始化它”。</p>
+
+<h1>8. 构建期架构</h1>
+
+<whiteboard type="mermaid" path="@architecture/build-architecture.mmd"></whiteboard>
+
+<p>权威构建链是 <code>./configure → configure.py → config.gypi/config.mk → GYP → Make/Ninja/MSBuild → node.gyp target graph → node</code>。<code>node.gyp</code> 的核心目标关系是 <code>node executable → libnode → node_base</code>，可执行 target 自身只有很薄的 <code>src/node_main.cc</code>。<code>BUILD.gn</code> 明文说明 GN 不是官方二进制构建系统；只修改 GN 即使成功，也不能证明发布路径包含变更。</p>
+
+<p><code>node_js2c</code> 把 <code>lib/**/*.js</code>、选定依赖 JS 与 <code>config.gypi</code> 生成 <code>node_javascript.cc</code>，随后 <code>node_mksnapshot</code> 生成 <code>node_snapshot.cc</code>。这样解决“加载 fs 之前却先需要 fs”的 bootstrap 循环，使 binary、core JS 与构建配置原子一致，并把确定性初始化移出每次启动。</p>
+
+<h1>9. 核心设计思想：因果与反事实</h1>
+
+<table>
+  <thead><tr><th>设计</th><th>为什么存在</th><th>如果反过来会怎样</th></tr></thead>
+  <tbody>
+    <tr><td>Node 编排 V8 与 libuv</td><td>语言执行、OS 异步与宿主 API 是三类独立问题。</td><td>只有 V8 没有 I/O/进程/模块；只有 libuv 没有 JS；各平台自写 runtime 会让语义分裂。</td></tr>
+    <tr><td>JS 负责策略，C++ 负责机制</td><td>模块、stream、兼容和校验需要快速演进；引擎/OS 资源必须 native。</td><td>全 C++ 使 API 迭代昂贵；全 JS 无法可靠访问 V8/OS 原语。</td></tr>
+    <tr><td>每个 Isolate 单线程进入</td><td>避免共享 heap 普遍加锁，保持 callback run-to-completion；并行由 Worker 显式表达。</td><td>多线程同时进入同一 heap 会引入竞态、锁成本和不可预测 GC。</td></tr>
+    <tr><td>Builtin/CJS/ESM 分离</td><td>core 必须先于 fs/用户 hooks 启动，CJS 与 ESM 又有不同语义。</td><td>统一 loader 会形成 bootstrap 循环或破坏 require/TLA/hooks 兼容。</td></tr>
+    <tr><td>内嵌 JS + snapshot</td><td>自包含、版本原子一致并降低启动初始化成本。</td><td>磁盘加载增加路径、I/O、篡改和版本错配；每次完整 bootstrap 增加启动成本。</td></tr>
+    <tr><td>BaseObject/AsyncWrap</td><td>协调 JS GC、OS resource、native request 和异步上下文。</td><td>仅 GC 会早释放，只有 native 引用会泄漏，不记录 trigger id 会丢因果链。</td></tr>
+    <tr><td>分阶段清理</td><td>Worker、handle、Realm、Environment、Isolate、Platform 有反向依赖。</td><td>销毁顺序错误会让迟到 callback 访问已释放状态，导致 UAF 或泄漏。</td></tr>
+  </tbody>
+</table>
+
+<h1>10. 兼容与扩展边界</h1>
+
+<table>
+  <thead><tr><th>扩展面</th><th>兼容边界</th></tr></thead>
+  <tbody>
+    <tr><td>公共 JS API</td><td>以 doc/api 稳定等级、弃用政策与 SemVer 为契约；Experimental 需单独审计。</td></tr>
+    <tr><td>Node-API</td><td>推荐的稳定 C ABI，目标是跨 Node major 免重编译；当前源码支持 Node-API 1..10。</td></tr>
+    <tr><td>直接 V8/Node C++ addon</td><td>受 NODE_MODULE_VERSION 约束，当前为 147；不匹配时 process.dlopen 拒绝加载。</td></tr>
+    <tr><td>C++ Embedder API</td><td>可在其他 C++ 软件中创建 Node Environment，但允许 semver-major 无预警 breaking change。</td></tr>
+    <tr><td>lib/internal / internalBinding</td><td>core-private，不向用户承诺稳定；--expose-internals 只供维护调试。</td></tr>
+  </tbody>
+</table>
+
+<h1>11. 仓库地图与推荐阅读路径</h1>
+
+<table>
+  <thead><tr><th>路径</th><th>责任</th></tr></thead>
+  <tbody>
+    <tr><td>src/</td><td>C++ runtime、binding、V8/libuv glue、Worker、Inspector、Node-API/Embedder public headers。</td></tr>
+    <tr><td>lib/</td><td>公共 JS core API、lib/internal、bootstrap、main modes、CJS/ESM loader。</td></tr>
+    <tr><td>deps/</td><td>vendored JS/native 依赖、构建/测试依赖和随发行包交付工具。</td></tr>
+    <tr><td>tools/</td><td>GYP、js2c、snapshot、test runner、lint、doc、依赖更新和 release 工具。</td></tr>
+    <tr><td>test/</td><td>JS 行为、C++、addon、Node-API、WPT、TTY、sequential/parallel、已知问题和负载测试。</td></tr>
+    <tr><td>benchmark/</td><td>组件与跨模块性能测量；结果不能越过实际执行路径外推 production。</td></tr>
+    <tr><td>doc/</td><td>公共 API 契约、构建/测试/发布与维护工作流。</td></tr>
+    <tr><td>typings/</td><td>core 内部 noEmit 静态类型辅助，不是用户侧 @types/node。</td></tr>
+  </tbody>
+</table>
+
+<p>推荐按因果链阅读：<code>node_main.cc → node.cc → node_main_instance.cc → api/environment.cc → bootstrap/realm.js → bootstrap/node.js → pre_execution.js → run_main.js → 一个纵向 API（例如 fs.js → node_binding.cc → node_file.cc → libuv）→ embed_helpers.cc/task_queues.js → node_worker.cc → configure.py/node.gyp/js2c/snapshot</code>。</p>
+
+<h1>12. 证据范围与交付状态</h1>
+
+<p>本文以当前 HEAD 的源码和仓库文档交叉验证了构建、启动、module、binding、async、Worker、cleanup 与兼容边界，并将 build-time、runtime、线程/Isolate、public/internal 和 component/end-to-end 证据范围分开。</p>
+
+<p>本文没有声称当前 HEAD 已在本机编译、安装或激活；没有声称某个具体应用的生产吞吐、延迟、内存或 soak 状态；也没有把组件 benchmark 外推成端到端或 production 结论。因此交付状态是“源码架构已取证并文档化”，不是 runtime/system/production verification。</p>
+
+<p><b>关键源码索引：</b><code>src/node_main.cc:34-98</code>；<code>src/node.cc:288-405,1564-1639</code>；<code>src/node_main_instance.cc:33-110</code>；<code>src/api/embed_helpers.cc:23-77</code>；<code>src/node_worker.cc:159-220,296-435,727-773</code>；<code>lib/internal/bootstrap/realm.js:1-39,185-238</code>；<code>node.gyp:1073-1196</code>；<code>doc/api/n-api.md:7-20</code>。</p>

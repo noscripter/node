@@ -1,0 +1,43 @@
+flowchart LR
+  CONFIG["configure.py：探测平台、编译器、CPU、依赖和功能开关"]
+  GYPI["config.gypi：本次构建的事实配置"]
+  GYP["node.gyp + common.gypi + node.gypi：官方二进制的权威构建图"]
+  BACKEND["GYP 后端：Make / Ninja / MSBuild / Xcode"]
+
+  LIBJS["lib/**/*.js：公共 API、internal、bootstrap、main"]
+  SHAREJS["deps/undici、Amaro 与选定 V8 工具 JS"]
+  JS2C["node_js2c：把 JS 与 config.gypi 转成 C++ 嵌入数据"]
+  EMBED["node_javascript.cc：BuiltinModule 可读取的内嵌源码"]
+
+  CPPSRC["src/**/*.cc：runtime、binding、module、worker、diagnostics"]
+  NATIVEDEPS["deps/：V8、libuv、OpenSSL、llhttp、nghttp2、ICU、压缩库等"]
+  NODEBASE["node_base：Node C++ 核心 + 内嵌 JS"]
+  LIBNODE["libnode：Node 可执行文件和 embedder 共用的运行时库"]
+
+  MKSNAPSHOT["node_mksnapshot：执行 snapshot-safe bootstrap 并生成 code cache"]
+  SNAPSHOT["node_snapshot.cc：预初始化 V8 heap；可按配置禁用或替换"]
+  MAINCC["src/node_main.cc：极薄的平台 main / wmain 入口"]
+  BIN["node 可执行文件：libnode + main + snapshot + 选定依赖"]
+
+  TEST["test/ + tools/test.py：JS 行为、C++、addons、Node-API、WPT 与平台测试"]
+  BENCH["benchmark/：组件与跨模块性能测量，不自动等于端到端生产结论"]
+  DOC["doc/ + tools/doc：API 文档、弃用与兼容契约"]
+  GN["BUILD.gn：非官方/辅助构建入口；构建系统改动应回写 GYP"]
+
+  CONFIG --> GYPI --> GYP --> BACKEND
+  LIBJS --> JS2C
+  SHAREJS --> JS2C
+  GYPI --> JS2C --> EMBED --> NODEBASE
+  CPPSRC --> NODEBASE
+  NATIVEDEPS --> NODEBASE
+  NODEBASE --> LIBNODE
+  NODEBASE --> MKSNAPSHOT --> SNAPSHOT --> LIBNODE
+  LIBNODE --> BIN
+  MAINCC --> BIN
+  BACKEND --> JS2C
+  BACKEND --> NODEBASE
+  BACKEND --> MKSNAPSHOT
+  TEST -->|验证| BIN
+  BENCH -->|测量| BIN
+  DOC -->|定义公开行为| LIBJS
+  GN -.辅助路径.-> BIN

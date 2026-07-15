@@ -1,0 +1,24 @@
+flowchart LR
+  JS["某个 Environment 的 JS 回调线程：同一时刻只执行一段用户 JS"]
+  API{"异步工作的性质"}
+  NET["网络 socket / pipe：注册非阻塞 readiness"]
+  FILE["FS、getaddrinfo、部分 crypto/压缩：提交可能阻塞的原生工作"]
+  CPU["CPU 密集用户 JavaScript：显式创建 Worker"]
+  MICRO["Promise microtask / process.nextTick：进入 per-Isolate / per-Environment 队列"]
+
+  POLL["OS poller：epoll / kqueue / IOCP"]
+  POOL["libuv 全局 worker pool：默认 4，可由 UV_THREADPOOL_SIZE 调整"]
+  WORKER["Worker OS 线程：独立 Isolate、heap、GC、uv_loop 与 module cache"]
+  LOOP["所属 event loop：取回 completion 并建立 native → JS callback scope"]
+  QUEUE["nextTick / microtask / rejection checkpoint"]
+  CALLBACK["用户 callback / Promise continuation：仍在所属 JS 线程运行"]
+
+  JS --> API
+  API -->|非阻塞 I/O| NET --> POLL --> LOOP
+  API -->|阻塞或 CPU 型 native work| FILE --> POOL --> LOOP
+  API -->|并行 JS| CPU --> WORKER -->|MessagePort / structured clone| LOOP
+  API -->|语言级任务| MICRO --> QUEUE
+  LOOP --> QUEUE --> CALLBACK --> JS
+
+  V8BG["V8 Platform background threads：处理 GC/JIT 等引擎任务"]
+  V8BG -.完成后把 foreground task 投回.-> LOOP

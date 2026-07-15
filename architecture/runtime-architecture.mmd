@@ -1,0 +1,83 @@
+flowchart TB
+  INVOKE["进程入口：node app.js / -e / REPL / test / watch / SEA / C++ Embedder"]
+  USER["用户代码：CommonJS、ESM、Web API、业务回调"]
+  ADDON["原生扩展 .node：补充本地能力或复用原生库"]
+
+  subgraph LIFECYCLE["C++ 生命周期与实例编排（src/）"]
+    START["node::Start / StartInternal：解析选项，初始化 OpenSSL、NodePlatform 与 V8"]
+    MAIN["NodeMainInstance：创建主 Isolate、IsolateData、Environment"]
+    INSTANCE["Node 实例边界：1 Environment + 1 uv_loop + 1 Isolate + 1 principal Realm"]
+    LOOP["SpinEventLoopInternal：uv_run、DrainTasks、beforeExit、exit 与清理"]
+    WORKER["Worker：独立 OS 线程、uv_loop、Isolate、Environment 与模块缓存"]
+    MSG["MessagePort / structured clone / SharedArrayBuffer：显式跨 Worker 通信"]
+    DIAG["Inspector、async_hooks、diagnostics_channel、trace_events、perf_hooks、report"]
+  end
+
+  subgraph JSLAYER["JavaScript 语义与策略层（lib/）"]
+    BOOT["Bootstrap：primordials、realm.js、node.js、pre_execution"]
+    BUILTIN["BuiltinModule：装载已嵌入二进制的核心 JS，不依赖启动时磁盘 I/O"]
+    LOADERS["用户模块装载：CJS 与 ESM 的 resolve、cache、hooks、compile/evaluate"]
+    PUBLIC["公共核心 API：fs、net、http、streams、timers、crypto、worker、fetch 等"]
+    INTERNAL["lib/internal：参数校验、策略组合、兼容逻辑与内部状态"]
+    TASKS["调度语义：timer/immediate、process.nextTick、Promise microtask 与 rejection"]
+  end
+
+  subgraph BRIDGE["JS ↔ Native 边界与对象生命周期"]
+    IB["internalBinding(name)：私有核心 JS 到 C++ binding registry 的桥"]
+    WRAP["BaseObject → AsyncWrap → HandleWrap / ReqWrap：绑定 JS 对象、原生资源和异步因果"]
+    NAPI["process.dlopen + Node-API：推荐的稳定原生扩展 ABI"]
+    DIRECT["直接 V8 / Node C++ Addon ABI：能力更底层，但随 NODE_MODULE_VERSION 变化"]
+  end
+
+  subgraph NATIVE["执行引擎、跨平台 I/O 与专用原生库（deps/）"]
+    V8["V8：ECMAScript / WebAssembly、JIT、GC、Isolate、Context、microtask"]
+    UV["libuv：事件循环、socket poll、timer、process、FS/DNS 抽象与全局线程池"]
+    PROTOCOL["OpenSSL / ncrypto、llhttp、nghttp2、c-ares：TLS、加密与网络协议"]
+    DATA["ICU、Ada、simdutf、zlib/Brotli/zstd、SQLite：文本、URL、压缩与数据能力"]
+    JSDEPS["Undici、Amaro 等嵌入 JS 依赖：fetch/WebSocket 与 TypeScript type stripping"]
+  end
+
+  subgraph RESOURCES["实际并发资源与操作系统"]
+    POLLER["epoll / kqueue / IOCP：网络 readiness；回调在所属 loop 线程执行"]
+    UVPOOL["libuv 全局 worker pool：FS、系统 DNS、部分 crypto/压缩和 uv_queue_work"]
+    V8BG["V8 Platform 后台线程：GC/JIT 等引擎任务，不直接运行用户回调"]
+    OS["OS：文件、socket、进程、信号、终端与系统时钟"]
+  end
+
+  INVOKE --> START --> MAIN --> INSTANCE
+  INSTANCE --> BOOT --> BUILTIN --> LOADERS --> USER
+  USER --> PUBLIC --> INTERNAL
+  INTERNAL --> TASKS
+  INTERNAL --> IB
+  PUBLIC --> IB
+  ADDON --> NAPI
+  ADDON --> DIRECT
+  NAPI --> INSTANCE
+  DIRECT --> V8
+  IB --> WRAP
+  WRAP --> INSTANCE
+  WRAP --> UV
+  IB --> V8
+  IB --> UV
+  IB --> PROTOCOL
+  INTERNAL --> JSDEPS
+  TASKS --> LOOP
+  INSTANCE --> LOOP
+  INSTANCE --> V8
+  INSTANCE --> UV
+  INSTANCE --> DIAG
+  WRAP --> DIAG
+  USER -->|new Worker| WORKER
+  INSTANCE -->|发送到主线程| MSG
+  MSG -->|送达主 Environment| INSTANCE
+  MSG -->|发送到子线程| WORKER
+  WORKER -->|送达 Worker| MSG
+  WORKER -->|每个 Worker 重复实例边界| INSTANCE
+  UV --> POLLER
+  UV --> UVPOOL
+  V8 --> V8BG
+  PROTOCOL --> OS
+  DATA --> OS
+  POLLER --> OS
+  UVPOOL --> OS
+  LOOP -->|完成回调进入 JS| TASKS
