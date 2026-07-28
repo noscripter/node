@@ -1020,6 +1020,8 @@ void ChannelWrap::Setup() {
   options.timeout = timeout_;
   options.tries = tries_;
   options.qcache_max_ttl = 0;
+  // Resolver APIs always perform DNS queries and must not consult hosts files.
+  options.lookups = const_cast<char*>("b");
 
   int r;
   if (!library_inited_) {
@@ -1033,7 +1035,7 @@ void ChannelWrap::Setup() {
 
   /* We do the call to ares_init_option for caller. */
   int optmask = ARES_OPT_FLAGS | ARES_OPT_TIMEOUTMS | ARES_OPT_SOCK_STATE_CB |
-                ARES_OPT_TRIES | ARES_OPT_QUERY_CACHE;
+                ARES_OPT_TRIES | ARES_OPT_QUERY_CACHE | ARES_OPT_LOOKUPS;
 
   if (max_timeout_ > 0) {
     options.maxtimeout = max_timeout_;
@@ -2230,15 +2232,9 @@ void SetServers(const FunctionCallbackInfo<Value>& args) {
 
   uint32_t len = arr->Length();
 
-  if (len == 0) {
-    int rv = ares_set_servers(channel->cares_channel(), nullptr);
-    return args.GetReturnValue().Set(rv);
-  }
-
-  std::vector<ares_addr_port_node> servers(len);
-  ares_addr_port_node* last = nullptr;
-
-  int err;
+  // An empty list clears all configured servers. ares_set_servers_ports_csv()
+  // treats an empty string as "blank all servers".
+  std::string csv;
 
   for (uint32_t i = 0; i < len; i++) {
     Local<Value> val;
@@ -2263,37 +2259,27 @@ void SetServers(const FunctionCallbackInfo<Value>& args) {
     node::Utf8Value ip(env->isolate(), ipValue);
     int port = portValue->Int32Value(env->context()).FromJust();
 
-    ares_addr_port_node* cur = &servers[i];
+    if (!csv.empty()) csv += ',';
 
-    cur->tcp_port = cur->udp_port = port;
+    // Incoming CSV format expected by c-ares: host[:port][,host[:port]]...
+    // IPv6 addresses must be wrapped in square brackets.
     switch (fam) {
       case 4:
-        cur->family = AF_INET;
-        err = uv_inet_pton(AF_INET, *ip, &cur->addr);
+        csv += *ip;
         break;
       case 6:
-        cur->family = AF_INET6;
-        err = uv_inet_pton(AF_INET6, *ip, &cur->addr);
+        csv += '[';
+        csv += *ip;
+        csv += ']';
         break;
       default:
         UNREACHABLE("Bad address family");
     }
-
-    if (err)
-      break;
-
-    cur->next = nullptr;
-
-    if (last != nullptr)
-      last->next = cur;
-
-    last = cur;
+    csv += ':';
+    csv += std::to_string(port);
   }
 
-  if (err == 0)
-    err = ares_set_servers_ports(channel->cares_channel(), servers.data());
-  else
-    err = ARES_EBADSTR;
+  int err = ares_set_servers_ports_csv(channel->cares_channel(), csv.c_str());
 
   if (err == ARES_SUCCESS)
     channel->set_is_servers_default(false);

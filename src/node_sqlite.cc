@@ -1584,6 +1584,13 @@ void DatabaseSync::Exec(const FunctionCallbackInfo<Value>& args) {
     return;
   }
 
+  // Keep the database alive during sqlite3_exec(), which may call
+  // user-defined SQLite functions that trigger JavaScript callbacks.
+  // If the JavaScript callback drops all references to the database,
+  // the DatabaseSync could otherwise be garbage-collected while the
+  // SQLite callback is still executing, causing a use-after-free.
+  BaseObjectPtr<DatabaseSync> guard(db);
+
   Utf8Value sql(env->isolate(), args[0].As<String>());
   int r = sqlite3_exec(db->connection_, *sql, nullptr, nullptr, nullptr);
   CHECK_ERROR_OR_THROW(env->isolate(), db, r, SQLITE_OK, void());
@@ -2117,7 +2124,7 @@ void DatabaseSync::CreateSession(const FunctionCallbackInfo<Value>& args) {
   CHECK_ERROR_OR_THROW(env->isolate(), db, r, SQLITE_OK, void());
 
   BaseObjectPtr<Session> session =
-      Session::Create(env, BaseObjectWeakPtr<DatabaseSync>(db), pSession);
+      Session::Create(env, BaseObjectPtr<DatabaseSync>(db), pSession);
   args.GetReturnValue().Set(session->object());
 }
 
@@ -2357,6 +2364,13 @@ void DatabaseSync::ApplyChangeset(const FunctionCallbackInfo<Value>& args) {
       };
     }
   }
+
+  // Keep the database alive during sqlite3changeset_apply(), which may
+  // call conflict or filter callbacks that trigger JavaScript execution.
+  // If the JavaScript callback drops all references to the database,
+  // the DatabaseSync could otherwise be garbage-collected while the
+  // callback is still executing, causing a use-after-free.
+  BaseObjectPtr<DatabaseSync> guard(db);
 
   ArrayBufferViewContents<uint8_t> buf(args[0]);
   int r = sqlite3changeset_apply(
@@ -3788,7 +3802,7 @@ void StatementSyncIterator::Return(const FunctionCallbackInfo<Value>& args) {
 
 Session::Session(Environment* env,
                  Local<Object> object,
-                 BaseObjectWeakPtr<DatabaseSync> database,
+                 BaseObjectPtr<DatabaseSync> database,
                  sqlite3_session* session)
     : BaseObject(env, object),
       session_(session),
@@ -3801,7 +3815,7 @@ Session::~Session() {
 }
 
 BaseObjectPtr<Session> Session::Create(Environment* env,
-                                       BaseObjectWeakPtr<DatabaseSync> database,
+                                       BaseObjectPtr<DatabaseSync> database,
                                        sqlite3_session* session) {
   Local<Object> obj;
   if (!GetConstructorTemplate(env)
@@ -3835,7 +3849,9 @@ Local<FunctionTemplate> Session::GetConstructorTemplate(Environment* env) {
   return tmpl;
 }
 
-void Session::MemoryInfo(MemoryTracker* tracker) const {}
+void Session::MemoryInfo(MemoryTracker* tracker) const {
+  tracker->TrackField("database", database_);
+}
 
 template <Sqlite3ChangesetGenFunc sqliteChangesetFunc>
 void Session::Changeset(const FunctionCallbackInfo<Value>& args) {
